@@ -1,10 +1,3 @@
-//
-//  MediaOrganizerApp.swift
-//  MediaOrganizer
-//
-//  Created by Mufeeez . on 18/12/25.
-//
-
 import SwiftUI
 
 @main
@@ -13,5 +6,8 @@ struct MediaOrganizerApp: App {
         WindowGroup {
             ContentView()
         }
+        .windowStyle(.automatic)
     }
 }
+
+
