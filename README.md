@@ -16,10 +16,6 @@ A native macOS application built with SwiftUI that helps you organize your media
 - **📝 Detailed Logging**: Comprehensive log of all operations with timestamps
 - **⚡ Non-Blocking UI**: All operations run on background threads to keep the UI responsive
 
-## 🖥️ Screenshots
-
-*Add screenshots of your app here*
-
 ## 📋 Requirements
 
 - macOS 12.0 (Monterey) or later
