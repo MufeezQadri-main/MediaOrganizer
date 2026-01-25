@@ -13,6 +13,7 @@ final class MediaOrganizerViewModel: ObservableObject {
     @Published var totalCopiedSuccessfully: Int = 0
     @Published var totalConverted: Int = 0
     @Published var totalSkippedDuplicates: Int = 0
+    @Published var totalSkipped: Int = 0
     @Published var errorCount: Int = 0
     
     @Published var isScanning: Bool = false
@@ -20,7 +21,6 @@ final class MediaOrganizerViewModel: ObservableObject {
     @Published var statusMessage: String = "Idle"
     @Published var logMessages: [String] = []
     
-    /// 0.0...1.0 based on files processed; nil when not running
     @Published var progress: Double? = nil
     
     // Processing settings
@@ -35,12 +35,36 @@ final class MediaOrganizerViewModel: ObservableObject {
     @Published var processingSpeed: String?
     @Published var currentFileName: String?
     @Published var availableDiskSpace: String?
+    @Published var totalSizeFormatted: String = "-"
     
     // Scan results
     @Published var scanComplete: Bool = false
     @Published var mediaFiles: [MediaFileInfo] = []
     
-    struct MediaFileInfo: Identifiable {
+    // Alert handling
+    @Published var showAlert: Bool = false
+    @Published var alertMessage: String?
+    
+    // Validation
+    @Published var validationWarning: String?
+    
+    // MARK: - Computed Properties for UI State
+    
+    var isScanDisabled: Bool {
+        isScanning || isProcessing || sourceURL == nil
+    }
+    
+    var isProcessDisabled: Bool {
+        !scanComplete || isProcessing || destinationURL == nil || validationWarning != nil || mediaFiles.isEmpty
+    }
+    
+    var canUndo: Bool {
+        !operationLog.isEmpty && !isProcessing
+    }
+    
+    // MARK: - Data Types
+    
+    struct MediaFileInfo: Identifiable, Sendable {
         let id = UUID()
         let url: URL
         let type: MediaType
@@ -48,8 +72,8 @@ final class MediaOrganizerViewModel: ObservableObject {
         let creationDate: Date?
         let needsConversion: Bool
         
-        enum MediaType {
-            case image(String) // original extension
+        enum MediaType: Sendable {
+            case image(String)
             case video(String)
             
             var isImage: Bool {
@@ -61,34 +85,44 @@ final class MediaOrganizerViewModel: ObservableObject {
     
     // MARK: - Configuration
     
-    private let iOSSupportedImageFormats: Set<String> = ["jpg", "jpeg", "png", "heic", "gif"]
-    private let iOSSupportedVideoFormats: Set<String> = ["mp4", "mov"]
+    private let iOSSupportedImageFormats: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "gif"]
+    private let iOSSupportedVideoFormats: Set<String> = ["mp4", "mov", "m4v"]
     
     private let allImageFormats: Set<String> = [
-        "jpg", "jpeg", "png", "heic", "gif", "bmp", "tiff", "tif", "webp"
+        "jpg", "jpeg", "png", "heic", "heif", "gif", "bmp", "tiff", "tif", "webp", "raw", "cr2", "nef", "arw", "dng"
     ]
     
     private let allVideoFormats: Set<String> = [
-        "mp4", "mov", "mkv", "avi", "flv", "wmv", "webm"
+        "mp4", "mov", "m4v", "mkv", "avi", "flv", "wmv", "webm", "mpg", "mpeg", "3gp"
     ]
     
     private let fileManager = FileManager.default
-    private let maxLogMessages = 1000
+    private let maxLogMessages = 500
     
-    // Thread-safe counters and state
-    private let counterQueue = DispatchQueue(label: "com.mediaorganizer.counters")
-    private var internalScannedCount: Int = 0
-    private var internalMediaFoundCount: Int = 0
-    private var internalCopiedCount: Int = 0
-    private var internalConvertedCount: Int = 0
-    private var internalDuplicatesCount: Int = 0
-    private var internalErrorCount: Int = 0
+    // Thread-safe state management
+    private let stateQueue = DispatchQueue(label: "com.mediaorganizer.state", attributes: .concurrent)
+    private var _internalState = InternalState()
+    
+    private struct InternalState {
+        var scannedCount: Int = 0
+        var mediaFoundCount: Int = 0
+        var copiedCount: Int = 0
+        var convertedCount: Int = 0
+        var duplicatesCount: Int = 0
+        var skippedCount: Int = 0
+        var errorCount: Int = 0
+        var isCancelled: Bool = false
+        var processedFileHashes: Set<String> = []
+        var reservedFileNames: Set<String> = []
+    }
     
     // Processing state
     private var operationQueue: OperationQueue?
-    private var isCancelled = false
     private var startTime: Date?
-    private var processedFileHashes: Set<String> = []
+    
+    // Bookmark data for security-scoped access
+    private var sourceBookmarkData: Data?
+    private var destinationBookmarkData: Data?
     
     // Undo support
     private var operationLog: [FileOperation] = []
@@ -106,50 +140,116 @@ final class MediaOrganizerViewModel: ObservableObject {
         }
     }
     
+    // MARK: - Thread-Safe State Access
+    
+    private func readState<T>(_ keyPath: KeyPath<InternalState, T>) -> T {
+        stateQueue.sync { _internalState[keyPath: keyPath] }
+    }
+    
+    private func writeState<T>(_ keyPath: WritableKeyPath<InternalState, T>, value: T) {
+        stateQueue.async(flags: .barrier) { self._internalState[keyPath: keyPath] = value }
+    }
+    
+    private func modifyState(_ modification: @escaping (inout InternalState) -> Void) {
+        stateQueue.async(flags: .barrier) { modification(&self._internalState) }
+    }
+    
+    private func modifyStateSync<T>(_ modification: (inout InternalState) -> T) -> T {
+        stateQueue.sync(flags: .barrier) { modification(&self._internalState) }
+    }
+    
+    // MARK: - Validation
+    
+    private func validateConfiguration() {
+        guard let source = sourceURL, let destination = destinationURL else {
+            validationWarning = nil
+            return
+        }
+        
+        let sourcePath = source.standardizedFileURL.path
+        let destPath = destination.standardizedFileURL.path
+        
+        if sourcePath == destPath {
+            validationWarning = "Source and destination cannot be the same folder"
+            return
+        }
+        
+        if destPath.hasPrefix(sourcePath + "/") {
+            validationWarning = "Destination cannot be inside the source folder"
+            return
+        }
+        
+        if sourcePath.hasPrefix(destPath + "/") {
+            validationWarning = "Source cannot be inside the destination folder"
+            return
+        }
+        
+        validationWarning = nil
+    }
+    
     // MARK: - Folder Selection
     
     func pickSourceFolder() {
-        if let oldURL = sourceURL {
-            oldURL.stopAccessingSecurityScopedResource()
-        }
-        
         pickFolder { [weak self] url in
+            guard let self, let url else { return }
+            
+            // Create bookmark for persistent access
+            do {
+                let bookmarkData = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+                self.sourceBookmarkData = bookmarkData
+            } catch {
+                self.appendLog("Warning: Could not create bookmark for source: \(error.localizedDescription)")
+            }
+            
             DispatchQueue.main.async {
-                self?.sourceURL = url
-                self?.scanComplete = false
-                self?.mediaFiles = []
+                self.sourceURL = url
+                self.scanComplete = false
+                self.mediaFiles = []
+                self.totalSizeFormatted = "-"
+                self.validateConfiguration()
             }
         }
     }
     
     func pickDestinationFolder() {
-        if let oldURL = destinationURL {
-            oldURL.stopAccessingSecurityScopedResource()
-        }
-        
         pickFolder { [weak self] url in
+            guard let self, let url else { return }
+            
+            // Create bookmark for persistent access
+            do {
+                let bookmarkData = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+                self.destinationBookmarkData = bookmarkData
+            } catch {
+                self.appendLog("Warning: Could not create bookmark for destination: \(error.localizedDescription)")
+            }
+            
             DispatchQueue.main.async {
-                self?.destinationURL = url
-                self?.updateAvailableDiskSpace()
+                self.destinationURL = url
+                self.updateAvailableDiskSpace()
+                self.validateConfiguration()
             }
         }
     }
     
     private func pickFolder(completion: @escaping (URL?) -> Void) {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Select"
-        panel.canCreateDirectories = false
-        
-        panel.begin { response in
-            guard response == .OK, let url = panel.urls.first else {
-                completion(nil)
-                return
+        DispatchQueue.main.async {
+            let panel = NSOpenPanel()
+            panel.canChooseFiles = false
+            panel.canChooseDirectories = true
+            panel.allowsMultipleSelection = false
+            panel.prompt = "Select"
+            panel.canCreateDirectories = true
+            panel.message = "Select a folder"
+            
+            panel.begin { response in
+                guard response == .OK, let url = panel.urls.first else {
+                    completion(nil)
+                    return
+                }
+                
+                _ = url.startAccessingSecurityScopedResource()
+                completion(url)
             }
-            _ = url.startAccessingSecurityScopedResource()
-            completion(url)
         }
     }
     
@@ -163,7 +263,7 @@ final class MediaOrganizerViewModel: ObservableObject {
                     let formatter = ByteCountFormatter()
                     formatter.allowedUnits = [.useGB, .useMB]
                     formatter.countStyle = .file
-                    let spaceString = formatter.string(fromByteCount: Int64(capacity))
+                    let spaceString = formatter.string(fromByteCount: capacity)
                     
                     DispatchQueue.main.async {
                         self?.availableDiskSpace = spaceString
@@ -181,8 +281,7 @@ final class MediaOrganizerViewModel: ObservableObject {
     
     func startScan() {
         guard let sourceURL else {
-            appendLog("Please select source folder.")
-            statusOnMain("Missing source folder")
+            showError("Please select source folder.")
             return
         }
         
@@ -193,101 +292,99 @@ final class MediaOrganizerViewModel: ObservableObject {
         mediaFiles = []
         totalFilesScanned = 0
         totalMediaFound = 0
+        totalSizeFormatted = "-"
         
-        counterQueue.sync {
-            internalScannedCount = 0
-            internalMediaFoundCount = 0
-            isCancelled = false
+        modifyState { state in
+            state.scannedCount = 0
+            state.mediaFoundCount = 0
+            state.isCancelled = false
         }
         
         statusOnMain("Scanning folders...")
-        appendLog("Starting scan of \(sourceURL.path)")
+        appendLog("Starting scan of: \(sourceURL.path)")
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             
-            let sourceAccessGranted = sourceURL.startAccessingSecurityScopedResource()
+            let accessGranted = sourceURL.startAccessingSecurityScopedResource()
             defer {
-                if sourceAccessGranted {
+                if accessGranted {
                     sourceURL.stopAccessingSecurityScopedResource()
                 }
             }
             
-            do {
-                guard let enumerator = self.fileManager.enumerator(
-                    at: sourceURL,
-                    includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .creationDateKey],
-                    options: [.skipsHiddenFiles],
-                    errorHandler: { url, error in
-                        DispatchQueue.main.async {
-                            self.appendLog("Error accessing \(url.path): \(error.localizedDescription)")
-                        }
-                        return true
-                    }
-                ) else {
-                    DispatchQueue.main.async {
-                        self.appendLog("Failed to create enumerator for source folder.")
-                        self.finishScan(withStatus: "Scan Failed")
-                    }
-                    return
+            guard let enumerator = self.fileManager.enumerator(
+                at: sourceURL,
+                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .creationDateKey, .isReadableKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            ) else {
+                DispatchQueue.main.async {
+                    self.appendLog("❌ Failed to create folder enumerator")
+                    self.finishScan(withStatus: "Scan Failed")
+                }
+                return
+            }
+            
+            var foundMedia: [MediaFileInfo] = []
+            
+            for case let fileURL as URL in enumerator {
+                let cancelled = self.readState(\.isCancelled)
+                guard !cancelled else { break }
+                
+                // Check if it's a regular file
+                guard self.isRegularFile(url: fileURL) else { continue }
+                
+                let scanned = self.modifyStateSync { state -> Int in
+                    state.scannedCount += 1
+                    return state.scannedCount
                 }
                 
-                var foundMedia: [MediaFileInfo] = []
-                
-                for case let item as URL in enumerator {
-                    // Check for cancellation
-                    let cancelled = self.counterQueue.sync { self.isCancelled }
-                    guard !cancelled else { break }
-                    
-                    guard self.isRegularFile(url: item) else { continue }
-                    
-                    let scanned = self.counterQueue.sync {
-                        self.internalScannedCount += 1
-                        return self.internalScannedCount
-                    }
-                    
+                // Update UI periodically
+                if scanned % 100 == 0 {
                     DispatchQueue.main.async {
                         self.totalFilesScanned = scanned
                     }
+                }
+                
+                if let mediaInfo = self.getMediaFileInfo(url: fileURL) {
+                    foundMedia.append(mediaInfo)
                     
-                    if let mediaInfo = self.getMediaFileInfo(url: item) {
-                        foundMedia.append(mediaInfo)
-                        
-                        let mediaCount = self.counterQueue.sync {
-                            self.internalMediaFoundCount += 1
-                            return self.internalMediaFoundCount
-                        }
-                        
+                    let mediaCount = self.modifyStateSync { state -> Int in
+                        state.mediaFoundCount += 1
+                        return state.mediaFoundCount
+                    }
+                    
+                    if mediaCount % 100 == 0 {
                         DispatchQueue.main.async {
                             self.totalMediaFound = mediaCount
                         }
                     }
                 }
+            }
+            
+            let finalScanned = self.readState(\.scannedCount)
+            let finalFound = self.readState(\.mediaFoundCount)
+            
+            DispatchQueue.main.async {
+                self.totalFilesScanned = finalScanned
+                self.totalMediaFound = finalFound
+                self.mediaFiles = foundMedia
+                self.scanComplete = true
+                self.finishScan(withStatus: "Scan Complete")
+                self.appendLog("✅ Found \(foundMedia.count) media files in \(finalScanned) total files")
                 
-                DispatchQueue.main.async {
-                    self.mediaFiles = foundMedia
-                    self.scanComplete = true
-                    self.finishScan(withStatus: "Scan Complete")
-                    self.appendLog("Found \(foundMedia.count) media files in \(self.totalFilesScanned) total files")
-                    
-                    // Calculate total size
-                    let totalSize = foundMedia.reduce(0) { $0 + $1.size }
-                    let formatter = ByteCountFormatter()
-                    formatter.allowedUnits = [.useGB, .useMB]
-                    formatter.countStyle = .file
-                    self.appendLog("Total size: \(formatter.string(fromByteCount: Int64(totalSize)))")
-                    
-                    // Count conversions needed
-                    let needsConversion = foundMedia.filter { $0.needsConversion }.count
-                    if needsConversion > 0 {
-                        self.appendLog("\(needsConversion) files will be converted to iOS-supported formats")
-                    }
-                }
+                // Calculate total size
+                let totalSize = foundMedia.reduce(UInt64(0)) { $0 + $1.size }
+                let formatter = ByteCountFormatter()
+                formatter.allowedUnits = [.useGB, .useMB]
+                formatter.countStyle = .file
+                self.totalSizeFormatted = formatter.string(fromByteCount: Int64(totalSize))
+                self.appendLog("Total size: \(self.totalSizeFormatted)")
                 
-            } catch {
-                DispatchQueue.main.async {
-                    self.appendLog("Scan error: \(error.localizedDescription)")
-                    self.finishScan(withStatus: "Scan Failed")
+                // Count conversions needed
+                let needsConversion = foundMedia.filter { $0.needsConversion }.count
+                if needsConversion > 0 && self.convertToIOSFormat {
+                    self.appendLog("ℹ️ \(needsConversion) files will need conversion")
                 }
             }
         }
@@ -296,27 +393,28 @@ final class MediaOrganizerViewModel: ObservableObject {
     private func getMediaFileInfo(url: URL) -> MediaFileInfo? {
         let ext = url.pathExtension.lowercased()
         
+        guard !ext.isEmpty else { return nil }
+        
         var mediaType: MediaFileInfo.MediaType?
         var needsConversion = false
         
         if allImageFormats.contains(ext) {
             mediaType = .image(ext)
-            if convertToIOSFormat {
-                needsConversion = !iOSSupportedImageFormats.contains(ext)
-            }
+            needsConversion = !iOSSupportedImageFormats.contains(ext)
         } else if allVideoFormats.contains(ext) {
             mediaType = .video(ext)
-            if convertToIOSFormat {
-                needsConversion = !iOSSupportedVideoFormats.contains(ext)
-            }
+            needsConversion = !iOSSupportedVideoFormats.contains(ext)
         }
         
         guard let type = mediaType else { return nil }
         
         do {
             let values = try url.resourceValues(forKeys: [.fileSizeKey, .creationDateKey])
-            let size = values.fileSize.map { UInt64($0) } ?? 0
+            let size = UInt64(values.fileSize ?? 0)
             let creationDate = values.creationDate
+            
+            // Skip zero-byte files
+            guard size > 0 else { return nil }
             
             return MediaFileInfo(
                 url: url,
@@ -338,29 +436,29 @@ final class MediaOrganizerViewModel: ObservableObject {
     // MARK: - Process Logic
     
     func startProcessing() {
-        guard let destinationURL else {
-            appendLog("Please select destination folder.")
-            statusOnMain("Missing destination folder")
+        guard let sourceURL, let destinationURL else {
+            showError("Please select both source and destination folders.")
+            return
+        }
+        
+        validateConfiguration()
+        if let warning = validationWarning {
+            showError(warning)
             return
         }
         
         guard scanComplete, !mediaFiles.isEmpty else {
-            appendLog("Please run scan first.")
-            statusOnMain("No files to process")
+            showError("Please run scan first.")
             return
         }
         
         guard !isProcessing else { return }
         
-        // Clean up orphaned empty placeholder files from previous failed runs
-        cleanupOrphanedPlaceholders(in: destinationURL)
-        
         // Check disk space
         do {
             try checkDiskSpace(for: mediaFiles, destination: destinationURL)
         } catch {
-            appendLog("Insufficient disk space: \(error.localizedDescription)")
-            statusOnMain("Insufficient disk space")
+            showError(error.localizedDescription)
             return
         }
         
@@ -369,78 +467,105 @@ final class MediaOrganizerViewModel: ObservableObject {
         totalCopiedSuccessfully = 0
         totalConverted = 0
         totalSkippedDuplicates = 0
+        totalSkipped = 0
         errorCount = 0
         startTime = Date()
         operationLog = []
-        processedFileHashes = []
         
-        counterQueue.sync {
-            internalCopiedCount = 0
-            internalConvertedCount = 0
-            internalDuplicatesCount = 0
-            internalErrorCount = 0
-            isCancelled = false
+        modifyState { state in
+            state.copiedCount = 0
+            state.convertedCount = 0
+            state.duplicatesCount = 0
+            state.skippedCount = 0
+            state.errorCount = 0
+            state.isCancelled = false
+            state.processedFileHashes = []
+            state.reservedFileNames = []
         }
         
         let mode = isDryRun ? "DRY RUN" : (shouldCopyInsteadOfMove ? "COPY" : "MOVE")
         statusOnMain("Processing (\(mode))...")
-        appendLog("Starting \(mode.lowercased()) of \(mediaFiles.count) media files")
+        appendLog("🚀 Starting \(mode) of \(mediaFiles.count) files")
+        appendLog("Source: \(sourceURL.path)")
+        appendLog("Destination: \(destinationURL.path)")
         
         if isDryRun {
-            appendLog("⚠️ DRY RUN MODE - No files will be modified")
+            appendLog("⚠️ DRY RUN - No files will be modified")
         }
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             
-            let destAccessGranted = destinationURL.startAccessingSecurityScopedResource()
+            // Start security-scoped access
+            let sourceAccess = sourceURL.startAccessingSecurityScopedResource()
+            let destAccess = destinationURL.startAccessingSecurityScopedResource()
+            
             defer {
-                if destAccessGranted {
-                    destinationURL.stopAccessingSecurityScopedResource()
-                }
+                if sourceAccess { sourceURL.stopAccessingSecurityScopedResource() }
+                if destAccess { destinationURL.stopAccessingSecurityScopedResource() }
             }
             
-            // Create operation queue
+            // Create operation queue for concurrent processing
             let queue = OperationQueue()
             queue.maxConcurrentOperationCount = self.maxConcurrentOperations
             queue.qualityOfService = .userInitiated
             self.operationQueue = queue
             
             let totalFiles = self.mediaFiles.count
+            var processedCount = 0
+            let processedLock = NSLock()
             
-            // Process files concurrently
             for mediaFile in self.mediaFiles {
                 let operation = BlockOperation { [weak self] in
                     guard let self else { return }
                     
-                    let cancelled = self.counterQueue.sync { self.isCancelled }
+                    let cancelled = self.readState(\.isCancelled)
                     guard !cancelled else { return }
                     
-                    self.processMediaFile(mediaFile, destinationFolder: destinationURL, totalFiles: totalFiles)
+                    self.processMediaFile(mediaFile, destinationFolder: destinationURL)
                     
-                    // Update progress estimates
-                    self.updateProgressEstimates(totalFiles: totalFiles)
+                    // Update progress
+                    processedLock.lock()
+                    processedCount += 1
+                    let currentProcessed = processedCount
+                    processedLock.unlock()
+                    
+                    self.updateProgressEstimates(processed: currentProcessed, total: totalFiles)
                 }
                 queue.addOperation(operation)
             }
             
-            // Wait for completion
+            // Wait for all operations to complete
             queue.waitUntilAllOperationsAreFinished()
             
-            // Save operation log
-            if !self.isDryRun {
+            // Save operation log if not dry run
+            if !self.isDryRun && !self.operationLog.isEmpty {
                 self.saveOperationLog()
             }
             
-            let wasCancelled = self.counterQueue.sync { self.isCancelled }
+            let wasCancelled = self.readState(\.isCancelled)
+            let finalCopied = self.readState(\.copiedCount)
+            let finalConverted = self.readState(\.convertedCount)
+            let finalDuplicates = self.readState(\.duplicatesCount)
+            let finalSkipped = self.readState(\.skippedCount)
+            let finalErrors = self.readState(\.errorCount)
             
             DispatchQueue.main.async {
+                self.totalCopiedSuccessfully = finalCopied
+                self.totalConverted = finalConverted
+                self.totalSkippedDuplicates = finalDuplicates
+                self.totalSkipped = finalSkipped
+                self.errorCount = finalErrors
+                
                 if wasCancelled {
                     self.finishProcessing(withStatus: "Cancelled")
+                    self.appendLog("🛑 Processing cancelled")
                 } else {
-                    let summary = self.isDryRun ? "Dry Run Complete" : "Processing Complete"
-                    self.finishProcessing(withStatus: summary)
-                    self.appendLog("✅ \(summary): \(self.totalCopiedSuccessfully) processed, \(self.totalConverted) converted, \(self.totalSkippedDuplicates) duplicates skipped, \(self.errorCount) errors")
+                    let status = self.isDryRun ? "Dry Run Complete" : "Processing Complete"
+                    self.finishProcessing(withStatus: status)
+                    self.appendLog("✅ \(status)")
+                    self.appendLog("   Processed: \(finalCopied), Converted: \(finalConverted)")
+                    self.appendLog("   Duplicates: \(finalDuplicates), Skipped: \(finalSkipped), Errors: \(finalErrors)")
                 }
             }
         }
@@ -449,13 +574,11 @@ final class MediaOrganizerViewModel: ObservableObject {
     private func checkDiskSpace(for files: [MediaFileInfo], destination: URL) throws {
         let values = try destination.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         guard let availableCapacity = values.volumeAvailableCapacityForImportantUsage else {
-            throw NSError(domain: "DiskSpaceError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Could not determine available disk space"])
+            throw NSError(domain: "DiskSpace", code: -1, userInfo: [NSLocalizedDescriptionKey: "Could not determine available disk space"])
         }
         
         let totalNeeded = files.reduce(UInt64(0)) { $0 + $1.size }
-        
-        // Add 20% buffer for safety and conversion overhead
-        let neededWithBuffer = UInt64(Double(totalNeeded) * 1.2)
+        let neededWithBuffer = UInt64(Double(totalNeeded) * 1.3) // 30% buffer
         
         if neededWithBuffer > availableCapacity {
             let formatter = ByteCountFormatter()
@@ -465,162 +588,111 @@ final class MediaOrganizerViewModel: ObservableObject {
             let needed = formatter.string(fromByteCount: Int64(neededWithBuffer))
             let available = formatter.string(fromByteCount: Int64(availableCapacity))
             
-            throw NSError(domain: "DiskSpaceError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Need \(needed) but only \(available) available"])
+            throw NSError(domain: "DiskSpace", code: -1, userInfo: [NSLocalizedDescriptionKey: "Insufficient disk space. Need ~\(needed) but only \(available) available"])
         }
     }
     
-    private func processMediaFile(_ mediaFile: MediaFileInfo, destinationFolder: URL, totalFiles: Int) {
+    private func processMediaFile(_ mediaFile: MediaFileInfo, destinationFolder: URL) {
         let fileName = mediaFile.url.lastPathComponent
         
         DispatchQueue.main.async {
             self.currentFileName = fileName
         }
         
-        // Check for duplicates
+        // Verify file still exists and is readable
+        guard fileManager.fileExists(atPath: mediaFile.url.path),
+              fileManager.isReadableFile(atPath: mediaFile.url.path) else {
+            incrementError()
+            appendLog("❌ File not accessible: \(fileName)")
+            return
+        }
+        
+        // Check for duplicates if enabled
         if skipDuplicates {
             do {
-                let fileHash = try calculateFileHash(url: mediaFile.url)
+                let fileHash = try calculateFileHashStreaming(url: mediaFile.url)
                 
-                let isDuplicate = counterQueue.sync {
-                    if processedFileHashes.contains(fileHash) {
+                let isDuplicate = modifyStateSync { state -> Bool in
+                    if state.processedFileHashes.contains(fileHash) {
+                        state.duplicatesCount += 1
                         return true
                     }
-                    processedFileHashes.insert(fileHash)
+                    state.processedFileHashes.insert(fileHash)
                     return false
                 }
                 
                 if isDuplicate {
-                    counterQueue.sync { internalDuplicatesCount += 1 }
-                    DispatchQueue.main.async {
-                        self.totalSkippedDuplicates = self.counterQueue.sync { self.internalDuplicatesCount }
-                        self.appendLog("⏭️  Skipped duplicate: \(fileName)")
-                    }
+                    updateDuplicatesUI()
                     return
                 }
             } catch {
-                counterQueue.sync { internalErrorCount += 1 }
-                DispatchQueue.main.async {
-                    self.errorCount = self.counterQueue.sync { self.internalErrorCount }
-                    self.appendLog("❌ Failed to hash \(fileName): \(error.localizedDescription)")
-                }
-                return
+                // If hashing fails, log warning but continue with the copy
+                appendLog("⚠️ Hash failed for \(fileName), proceeding anyway")
             }
         }
         
+        // Dry run mode
         if isDryRun {
-            // Dry run mode - just log what would happen
-            let action = mediaFile.needsConversion ? "convert & copy" : "copy"
-            DispatchQueue.main.async {
-                self.appendLog("Would \(action): \(fileName)")
-            }
-            
-            counterQueue.sync { internalCopiedCount += 1 }
-            DispatchQueue.main.async {
-                self.totalCopiedSuccessfully = self.counterQueue.sync { self.internalCopiedCount }
-            }
+            let action = (mediaFile.needsConversion && convertToIOSFormat) ? "convert & copy" : (shouldCopyInsteadOfMove ? "copy" : "move")
+            appendLog("Would \(action): \(fileName)")
+            incrementCopied()
             return
         }
         
-        // Determine if conversion is needed
+        // Process the file
         do {
-            if mediaFile.needsConversion && convertToIOSFormat {
-                // Convert file
-                let destURL = try convertToIOSFormat(
-                    mediaFile: mediaFile,
-                    destinationFolder: destinationFolder
-                )
+            let needsConversion = mediaFile.needsConversion && convertToIOSFormat
+            
+            if needsConversion {
+                let destURL = try convertFile(mediaFile: mediaFile, destinationFolder: destinationFolder)
+                logOperation(source: mediaFile.url, destination: destURL, type: .convert)
+                incrementConverted()
+                incrementCopied()
                 
-                counterQueue.sync {
-                    internalConvertedCount += 1
-                    internalCopiedCount += 1
-                }
-                
-                // Log the operation
-                let operation = FileOperation(
-                    sourceURL: mediaFile.url,
-                    destinationURL: destURL,
-                    operationType: .convert,
-                    timestamp: Date()
-                )
-                counterQueue.sync {
-                    operationLog.append(operation)
-                }
-                
-                DispatchQueue.main.async {
-                    self.totalConverted = self.counterQueue.sync { self.internalConvertedCount }
-                    self.totalCopiedSuccessfully = self.counterQueue.sync { self.internalCopiedCount }
-                    if case .image(let ext) = mediaFile.type {
-                        self.appendLog("🔄 Converted (\(ext)→jpg) & copied: \(fileName)")
-                    } else if case .video(let ext) = mediaFile.type {
-                        self.appendLog("🔄 Converted (\(ext)→mp4) & copied: \(fileName)")
-                    }
+                if case .image(let ext) = mediaFile.type {
+                    appendLog("🔄 Converted \(ext)→jpg: \(fileName)")
+                } else if case .video(let ext) = mediaFile.type {
+                    appendLog("🔄 Converted \(ext)→mp4: \(fileName)")
                 }
             } else {
-                // Regular copy/move
-                let destURL = try copyOrMoveFile(
-                    from: mediaFile.url,
-                    to: destinationFolder,
-                    shouldCopy: shouldCopyInsteadOfMove
-                )
-                
-                counterQueue.sync { internalCopiedCount += 1 }
-                
-                // Log the operation
-                let operation = FileOperation(
-                    sourceURL: mediaFile.url,
-                    destinationURL: destURL,
-                    operationType: shouldCopyInsteadOfMove ? .copy : .move,
-                    timestamp: Date()
-                )
-                counterQueue.sync {
-                    operationLog.append(operation)
-                }
-                
-                DispatchQueue.main.async {
-                    self.totalCopiedSuccessfully = self.counterQueue.sync { self.internalCopiedCount }
-                    let verb = self.shouldCopyInsteadOfMove ? "Copied" : "Moved"
-                    self.appendLog("✅ \(verb): \(fileName)")
-                }
+                let destURL = try copyOrMoveFile(from: mediaFile.url, to: destinationFolder)
+                logOperation(source: mediaFile.url, destination: destURL, type: shouldCopyInsteadOfMove ? .copy : .move)
+                incrementCopied()
             }
             
         } catch {
-            counterQueue.sync { internalErrorCount += 1 }
-            DispatchQueue.main.async {
-                self.errorCount = self.counterQueue.sync { self.internalErrorCount }
-                self.appendLog("❌ Failed to process \(fileName): \(error.localizedDescription)")
-            }
+            incrementError()
+            appendLog("❌ \(fileName): \(error.localizedDescription)")
         }
     }
     
-    private func calculateFileHash(url: URL) throws -> String {
-        let data = try Data(contentsOf: url)
-        let hash = SHA256.hash(data: data)
-        return hash.compactMap { String(format: "%02x", $0) }.joined()
-    }
+    // MARK: - File Operations
     
-    private func copyOrMoveFile(from sourceURL: URL, to destinationFolder: URL, shouldCopy: Bool) throws -> URL {
-        let destURL = try reserveUniqueFileName(
+    private func copyOrMoveFile(from sourceURL: URL, to destinationFolder: URL) throws -> URL {
+        let destURL = getUniqueDestinationURL(
             baseName: sourceURL.deletingPathExtension().lastPathComponent,
             extension: sourceURL.pathExtension,
             in: destinationFolder
         )
         
-        // Preserve attributes
-        let attributes = try fileManager.attributesOfItem(atPath: sourceURL.path)
+        // Get original attributes before copy
+        let attributes = try? fileManager.attributesOfItem(atPath: sourceURL.path)
         
-        if shouldCopy {
+        if shouldCopyInsteadOfMove {
             try fileManager.copyItem(at: sourceURL, to: destURL)
         } else {
             try fileManager.moveItem(at: sourceURL, to: destURL)
         }
         
-        // Reapply attributes
-        try? fileManager.setAttributes(attributes, ofItemAtPath: destURL.path)
+        // Restore original attributes
+        if let attrs = attributes {
+            try? fileManager.setAttributes(attrs, ofItemAtPath: destURL.path)
+        }
         
         return destURL
     }
     
-    private func convertToIOSFormat(mediaFile: MediaFileInfo, destinationFolder: URL) throws -> URL {
+    private func convertFile(mediaFile: MediaFileInfo, destinationFolder: URL) throws -> URL {
         switch mediaFile.type {
         case .image:
             return try convertImageToJPEG(sourceURL: mediaFile.url, destinationFolder: destinationFolder)
@@ -631,24 +703,17 @@ final class MediaOrganizerViewModel: ObservableObject {
     
     private func convertImageToJPEG(sourceURL: URL, destinationFolder: URL) throws -> URL {
         let baseName = sourceURL.deletingPathExtension().lastPathComponent
+        let destURL = getUniqueDestinationURL(baseName: baseName, extension: "jpg", in: destinationFolder)
         
-        let destURL = try reserveUniqueFileName(
-            baseName: baseName,
-            extension: "jpg",
-            in: destinationFolder
-        )
-        
-        // Use sips for conversion
-        let process = Process()
-        
-        // Find sips executable
-        guard let sipsPath = findExecutable(name: "sips", paths: ["/usr/bin/sips"]) else {
-            throw NSError(domain: "ConversionError", code: -1, userInfo: [NSLocalizedDescriptionKey: "sips tool not found"])
+        guard let sipsPath = findExecutable(paths: ["/usr/bin/sips"]) else {
+            throw NSError(domain: "Conversion", code: -1, userInfo: [NSLocalizedDescriptionKey: "sips tool not found"])
         }
         
+        let process = Process()
         process.executableURL = URL(fileURLWithPath: sipsPath)
         process.arguments = [
             "-s", "format", "jpeg",
+            "-s", "formatOptions", "85",
             sourceURL.path,
             "--out", destURL.path
         ]
@@ -661,20 +726,20 @@ final class MediaOrganizerViewModel: ObservableObject {
         process.waitUntilExit()
         
         guard process.terminationStatus == 0 else {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let errorMessage = String(data: data, encoding: .utf8) ?? "Unknown error"
-            throw NSError(domain: "ConversionError", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "Image conversion failed: \(errorMessage)"])
+            try? fileManager.removeItem(at: destURL)
+            let errorData = pipe.fileHandleForReading.readDataToEndOfFile()
+            let errorMsg = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+            throw NSError(domain: "Conversion", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "sips failed: \(errorMsg)"])
         }
         
-        // Verify file was created and has reasonable size
-        let attributes = try fileManager.attributesOfItem(atPath: destURL.path)
-        guard let fileSize = attributes[.size] as? UInt64, fileSize > 100 else {
-            throw NSError(domain: "ConversionError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Converted file appears corrupted"])
+        // Verify output
+        guard fileManager.fileExists(atPath: destURL.path) else {
+            throw NSError(domain: "Conversion", code: -1, userInfo: [NSLocalizedDescriptionKey: "Conversion produced no output"])
         }
         
-        // Preserve original file dates
-        if let originalAttrs = try? fileManager.attributesOfItem(atPath: sourceURL.path) {
-            try? fileManager.setAttributes(originalAttrs, ofItemAtPath: destURL.path)
+        // Preserve dates
+        if let attrs = try? fileManager.attributesOfItem(atPath: sourceURL.path) {
+            try? fileManager.setAttributes(attrs, ofItemAtPath: destURL.path)
         }
         
         return destURL
@@ -682,21 +747,15 @@ final class MediaOrganizerViewModel: ObservableObject {
     
     private func convertVideoToMP4(sourceURL: URL, destinationFolder: URL) throws -> URL {
         let baseName = sourceURL.deletingPathExtension().lastPathComponent
+        let destURL = getUniqueDestinationURL(baseName: baseName, extension: "mp4", in: destinationFolder)
         
-        let destURL = try reserveUniqueFileName(
-            baseName: baseName,
-            extension: "mp4",
-            in: destinationFolder
-        )
-        
-        // Use ffmpeg for video conversion (if available)
-        guard let ffmpegPath = findExecutable(name: "ffmpeg", paths: [
-            "/usr/local/bin/ffmpeg",
+        guard let ffmpegPath = findExecutable(paths: [
             "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
             "/usr/bin/ffmpeg"
         ]) else {
-            // Fallback: just copy if ffmpeg not available
-            appendLog("⚠️  ffmpeg not found, copying video without conversion")
+            // Fallback: just copy without conversion
+            appendLog("⚠️ ffmpeg not found, copying without conversion")
             try fileManager.copyItem(at: sourceURL, to: destURL)
             return destURL
         }
@@ -706,8 +765,12 @@ final class MediaOrganizerViewModel: ObservableObject {
         process.arguments = [
             "-i", sourceURL.path,
             "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
             "-c:a", "aac",
-            "-strict", "experimental",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            "-y",
             destURL.path
         ]
         
@@ -719,89 +782,156 @@ final class MediaOrganizerViewModel: ObservableObject {
         process.waitUntilExit()
         
         guard process.terminationStatus == 0 else {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let errorMessage = String(data: data, encoding: .utf8) ?? "Unknown error"
-            throw NSError(domain: "ConversionError", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "Video conversion failed: \(errorMessage)"])
+            try? fileManager.removeItem(at: destURL)
+            throw NSError(domain: "Conversion", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "ffmpeg conversion failed"])
         }
         
-        // Verify file
-        let attributes = try fileManager.attributesOfItem(atPath: destURL.path)
-        guard let fileSize = attributes[.size] as? UInt64, fileSize > 1000 else {
-            throw NSError(domain: "ConversionError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Converted video appears corrupted"])
+        guard fileManager.fileExists(atPath: destURL.path) else {
+            throw NSError(domain: "Conversion", code: -1, userInfo: [NSLocalizedDescriptionKey: "Video conversion produced no output"])
         }
         
         return destURL
     }
     
-    private func findExecutable(name: String, paths: [String]) -> String? {
-        return paths.first { fileManager.fileExists(atPath: $0) }
-    }
+    // MARK: - Unique File Naming (Thread-Safe, No Placeholders)
     
-    private func reserveUniqueFileName(baseName: String, extension ext: String, in folder: URL) throws -> URL {
-        return counterQueue.sync {
-            var candidate = folder.appendingPathComponent("\(baseName).\(ext)")
+    private func getUniqueDestinationURL(baseName: String, extension ext: String, in folder: URL) -> URL {
+        // Sanitize the base name
+        let sanitizedBaseName = sanitizeFileName(baseName)
+        
+        return modifyStateSync { state -> URL in
+            var candidate = folder.appendingPathComponent("\(sanitizedBaseName).\(ext)")
             var index = 1
             
-            while fileManager.fileExists(atPath: candidate.path) {
-                candidate = folder.appendingPathComponent("\(baseName)_\(index).\(ext)")
+            // Check both filesystem and in-memory reservations
+            while self.fileManager.fileExists(atPath: candidate.path) || state.reservedFileNames.contains(candidate.path) {
+                candidate = folder.appendingPathComponent("\(sanitizedBaseName)_\(index).\(ext)")
                 index += 1
+                
+                // Safety limit
+                if index > 10000 {
+                    let uuid = UUID().uuidString.prefix(8)
+                    candidate = folder.appendingPathComponent("\(sanitizedBaseName)_\(uuid).\(ext)")
+                    break
+                }
             }
             
-            // Don't create a placeholder - just return the safe name
-            // The actual copy/move operation will create the file
+            // Reserve the path
+            state.reservedFileNames.insert(candidate.path)
+            
             return candidate
         }
     }
     
-    private func updateProgressEstimates(totalFiles: Int) {
-        guard let start = startTime else { return }
+    private func sanitizeFileName(_ name: String) -> String {
+        let invalidChars = CharacterSet(charactersIn: "/\\:*?\"<>|")
+        var sanitized = name.components(separatedBy: invalidChars).joined(separator: "_")
         
-        let processed = counterQueue.sync { internalCopiedCount }
-        guard processed > 0 else { return }
+        // Limit length
+        if sanitized.count > 200 {
+            sanitized = String(sanitized.prefix(200))
+        }
+        
+        // Handle empty names
+        if sanitized.trimmingCharacters(in: .whitespaces).isEmpty {
+            sanitized = "unnamed"
+        }
+        
+        return sanitized
+    }
+    
+    // MARK: - Streaming File Hash
+    
+    private func calculateFileHashStreaming(url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        
+        var hasher = SHA256()
+        let bufferSize = 1024 * 1024 // 1MB chunks
+        
+        while autoreleasepool(invoking: {
+            guard let data = try? handle.read(upToCount: bufferSize), !data.isEmpty else {
+                return false
+            }
+            hasher.update(data: data)
+            return true
+        }) {}
+        
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+    
+    // MARK: - Helper Methods
+    
+    private func findExecutable(paths: [String]) -> String? {
+        paths.first { fileManager.isExecutableFile(atPath: $0) }
+    }
+    
+    private func isRegularFile(url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return false }
+        return !isDirectory.boolValue
+    }
+    
+    // MARK: - Counter Updates
+    
+    private func incrementCopied() {
+        let count = modifyStateSync { state -> Int in
+            state.copiedCount += 1
+            return state.copiedCount
+        }
+        DispatchQueue.main.async { self.totalCopiedSuccessfully = count }
+    }
+    
+    private func incrementConverted() {
+        let count = modifyStateSync { state -> Int in
+            state.convertedCount += 1
+            return state.convertedCount
+        }
+        DispatchQueue.main.async { self.totalConverted = count }
+    }
+    
+    private func incrementError() {
+        let count = modifyStateSync { state -> Int in
+            state.errorCount += 1
+            return state.errorCount
+        }
+        DispatchQueue.main.async { self.errorCount = count }
+    }
+    
+    private func incrementSkipped() {
+        let count = modifyStateSync { state -> Int in
+            state.skippedCount += 1
+            return state.skippedCount
+        }
+        DispatchQueue.main.async { self.totalSkipped = count }
+    }
+    
+    private func updateDuplicatesUI() {
+        let count = readState(\.duplicatesCount)
+        DispatchQueue.main.async { self.totalSkippedDuplicates = count }
+    }
+    
+    // MARK: - Progress Updates
+    
+    private func updateProgressEstimates(processed: Int, total: Int) {
+        guard let start = startTime, processed > 0 else { return }
         
         let elapsed = Date().timeIntervalSince(start)
         let filesPerSecond = Double(processed) / elapsed
-        let remaining = totalFiles - processed
-        let estimatedSecondsRemaining = Double(remaining) / filesPerSecond
+        let remaining = total - processed
+        let estimatedSeconds = filesPerSecond > 0 ? Double(remaining) / filesPerSecond : 0
         
         DispatchQueue.main.async {
-            self.progress = Double(processed) / Double(totalFiles)
-            
-            // Format speed
+            self.progress = Double(processed) / Double(total)
             self.processingSpeed = String(format: "%.1f files/sec", filesPerSecond)
             
-            // Format time remaining
-            if estimatedSecondsRemaining < 60 {
-                self.estimatedTimeRemaining = String(format: "%.0f sec", estimatedSecondsRemaining)
-            } else if estimatedSecondsRemaining < 3600 {
-                self.estimatedTimeRemaining = String(format: "%.1f min", estimatedSecondsRemaining / 60)
+            if estimatedSeconds < 60 {
+                self.estimatedTimeRemaining = String(format: "%.0f sec remaining", estimatedSeconds)
+            } else if estimatedSeconds < 3600 {
+                self.estimatedTimeRemaining = String(format: "%.1f min remaining", estimatedSeconds / 60)
             } else {
-                self.estimatedTimeRemaining = String(format: "%.1f hrs", estimatedSecondsRemaining / 3600)
-            }
-        }
-    }
-    
-    private func saveOperationLog() {
-        guard !operationLog.isEmpty else { return }
-        
-        do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = .prettyPrinted
-            
-            let data = try encoder.encode(operationLog)
-            
-            let logsFolder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            let logFile = logsFolder.appendingPathComponent("media_organizer_log_\(Date().timeIntervalSince1970).json")
-            
-            try data.write(to: logFile)
-            
-            DispatchQueue.main.async {
-                self.appendLog("📝 Operation log saved to: \(logFile.path)")
-            }
-        } catch {
-            DispatchQueue.main.async {
-                self.appendLog("⚠️  Could not save operation log: \(error.localizedDescription)")
+                self.estimatedTimeRemaining = String(format: "%.1f hrs remaining", estimatedSeconds / 3600)
             }
         }
     }
@@ -814,6 +944,51 @@ final class MediaOrganizerViewModel: ObservableObject {
         estimatedTimeRemaining = nil
         processingSpeed = nil
         startTime = nil
+        operationQueue = nil
+    }
+    
+    // MARK: - Operation Logging
+    
+    private func logOperation(source: URL, destination: URL, type: FileOperation.OperationType) {
+        let operation = FileOperation(
+            sourceURL: source,
+            destinationURL: destination,
+            operationType: type,
+            timestamp: Date()
+        )
+        
+        stateQueue.async(flags: .barrier) {
+            self.operationLog.append(operation)
+        }
+    }
+    
+    private func saveOperationLog() {
+        let operations = stateQueue.sync { self.operationLog }
+        guard !operations.isEmpty else { return }
+        
+        do {
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = .prettyPrinted
+            
+            let data = try encoder.encode(operations)
+            
+            let logsFolder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateFormat = "yyyy-MM-dd_HHmmss"
+            let timestamp = dateFormatter.string(from: Date())
+            let logFile = logsFolder.appendingPathComponent("media_organizer_\(timestamp).json")
+            
+            try data.write(to: logFile)
+            
+            DispatchQueue.main.async {
+                self.appendLog("📝 Operation log saved: \(logFile.lastPathComponent)")
+            }
+        } catch {
+            DispatchQueue.main.async {
+                self.appendLog("⚠️ Could not save operation log: \(error.localizedDescription)")
+            }
+        }
     }
     
     // MARK: - Cancellation
@@ -821,67 +996,31 @@ final class MediaOrganizerViewModel: ObservableObject {
     func cancelOperation() {
         guard isScanning || isProcessing else { return }
         
-        counterQueue.sync {
-            isCancelled = true
+        modifyState { state in
+            state.isCancelled = true
         }
         
         operationQueue?.cancelAllOperations()
         
-        DispatchQueue.main.async {
-            self.appendLog("🛑 Operation cancelled by user")
-            if self.isScanning {
-                self.finishScan(withStatus: "Cancelled")
-            } else {
-                self.finishProcessing(withStatus: "Cancelled")
-            }
-        }
-    }
-    
-    // MARK: - Cleanup Helpers
-    
-    /// Removes orphaned zero-byte placeholder files from previous failed runs
-    private func cleanupOrphanedPlaceholders(in directory: URL) {
-        let fileManager = FileManager.default
-        
-        guard let contents = try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.fileSizeKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else {
-            return
-        }
-        
-        var cleanedCount = 0
-        for fileURL in contents {
-            do {
-                let attributes = try fileManager.attributesOfItem(atPath: fileURL.path)
-                let fileSize = attributes[.size] as? NSNumber
-                
-                // Remove zero-byte files (orphaned placeholders)
-                if fileSize?.intValue == 0 {
-                    try fileManager.removeItem(at: fileURL)
-                    cleanedCount += 1
-                }
-            } catch {
-                // Silently skip files we can't access
-                continue
-            }
-        }
-        
-        if cleanedCount > 0 {
-            appendLog("🧹 Cleaned up \(cleanedCount) orphaned placeholder file(s)")
-        }
+        appendLog("🛑 Cancellation requested...")
     }
     
     // MARK: - Undo
     
     func undoLastOperation() {
-        guard !operationLog.isEmpty else {
+        let operations = stateQueue.sync { self.operationLog }
+        
+        guard !operations.isEmpty else {
             appendLog("No operations to undo")
             return
         }
         
-        appendLog("⏮️  Starting undo...")
+        guard !isProcessing else {
+            appendLog("Cannot undo while processing")
+            return
+        }
+        
+        appendLog("⏮️ Starting undo of \(operations.count) operations...")
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -889,58 +1028,51 @@ final class MediaOrganizerViewModel: ObservableObject {
             var successCount = 0
             var failCount = 0
             
-            // Reverse the operations
-            for operation in self.operationLog.reversed() {
+            for operation in operations.reversed() {
                 do {
-                    // Delete the destination file
                     if self.fileManager.fileExists(atPath: operation.destinationURL.path) {
                         try self.fileManager.removeItem(at: operation.destinationURL)
                         successCount += 1
                     }
                     
-                    // If it was a move (not copy), restore the original
                     if operation.operationType == .move {
-                        // Note: This is why COPY is safer - we can't restore moved files
-                        DispatchQueue.main.async {
-                            self.appendLog("⚠️  Cannot restore moved file: \(operation.sourceURL.lastPathComponent)")
-                        }
+                        self.appendLog("⚠️ Cannot restore moved file: \(operation.sourceURL.lastPathComponent)")
                     }
                 } catch {
                     failCount += 1
-                    DispatchQueue.main.async {
-                        self.appendLog("❌ Failed to undo \(operation.destinationURL.lastPathComponent): \(error.localizedDescription)")
-                    }
+                    self.appendLog("❌ Undo failed for \(operation.destinationURL.lastPathComponent)")
                 }
             }
             
-            DispatchQueue.main.async {
+            self.stateQueue.async(flags: .barrier) {
                 self.operationLog = []
-                self.appendLog("✅ Undo complete: \(successCount) deleted, \(failCount) failed")
+            }
+            
+            DispatchQueue.main.async {
+                self.appendLog("✅ Undo complete: \(successCount) removed, \(failCount) failed")
+                self.totalCopiedSuccessfully = 0
+                self.totalConverted = 0
             }
         }
     }
     
-    // MARK: - Helpers
+    // MARK: - Logging
     
-    private func isRegularFile(url: URL) -> Bool {
-        do {
-            let values = try url.resourceValues(forKeys: [.isDirectoryKey])
-            return values.isDirectory == false
-        } catch {
-            return false
-        }
-    }
-    
-    private func appendLog(_ message: String) {
+    func appendLog(_ message: String) {
         let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        let logEntry = "[\(timestamp)] \(message)"
+        
         DispatchQueue.main.async {
-            self.logMessages.append("[\(timestamp)] \(message)")
+            self.logMessages.append(logEntry)
             
-            // Limit log size
             if self.logMessages.count > self.maxLogMessages {
                 self.logMessages.removeFirst(self.logMessages.count - self.maxLogMessages)
             }
         }
+    }
+    
+    func clearLogs() {
+        logMessages = []
     }
     
     private func statusOnMain(_ status: String) {
@@ -949,18 +1081,37 @@ final class MediaOrganizerViewModel: ObservableObject {
         }
     }
     
+    private func showError(_ message: String) {
+        DispatchQueue.main.async {
+            self.alertMessage = message
+            self.showAlert = true
+        }
+        appendLog("⚠️ \(message)")
+    }
+    
     // MARK: - Export Logs
     
-    func exportLogs() throws {
-        let logsFolder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let logFile = logsFolder.appendingPathComponent("media_organizer_logs_\(Date().timeIntervalSince1970).txt")
+    func exportLogs() {
+        guard !logMessages.isEmpty else {
+            showError("No logs to export")
+            return
+        }
         
-        let logContent = logMessages.joined(separator: "\n")
-        try logContent.write(to: logFile, atomically: true, encoding: .utf8)
-        
-        appendLog("📄 Logs exported to: \(logFile.path)")
-        
-        // Open in Finder
-        NSWorkspace.shared.activateFileViewerSelecting([logFile])
+        do {
+            let logsFolder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateFormat = "yyyy-MM-dd_HHmmss"
+            let timestamp = dateFormatter.string(from: Date())
+            let logFile = logsFolder.appendingPathComponent("media_organizer_logs_\(timestamp).txt")
+            
+            let logContent = logMessages.joined(separator: "\n")
+            try logContent.write(to: logFile, atomically: true, encoding: .utf8)
+            
+            appendLog("📄 Logs exported: \(logFile.lastPathComponent)")
+            
+            NSWorkspace.shared.activateFileViewerSelecting([logFile])
+        } catch {
+            showError("Failed to export logs: \(error.localizedDescription)")
+        }
     }
 }

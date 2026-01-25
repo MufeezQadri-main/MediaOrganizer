@@ -32,6 +32,7 @@ struct ContentView: View {
                                 title: "Source",
                                 subtitle: "Scan",
                                 selectedPath: viewModel.sourceURL?.lastPathComponent,
+                                fullPath: viewModel.sourceURL?.path,
                                 action: { viewModel.pickSourceFolder() }
                             )
                             
@@ -39,16 +40,32 @@ struct ContentView: View {
                                 title: "Destination",
                                 subtitle: "Target",
                                 selectedPath: viewModel.destinationURL?.lastPathComponent,
+                                fullPath: viewModel.destinationURL?.path,
                                 action: { viewModel.pickDestinationFolder() }
                             )
                         }
                         
+                        // Validation warning
+                        if let warning = viewModel.validationWarning {
+                            HStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 10))
+                                Text(warning)
+                                    .font(.system(size: 9, weight: .medium))
+                            }
+                            .foregroundColor(.orange)
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.orange.opacity(0.1))
+                            .cornerRadius(6)
+                        }
+                        
                         // Settings
                         VStack(spacing: 4) {
-                            MinimalToggle(title: "Copy", isOn: $viewModel.shouldCopyInsteadOfMove)
-                            MinimalToggle(title: "Convert", isOn: $viewModel.convertToIOSFormat)
-                            MinimalToggle(title: "Skip dupes", isOn: $viewModel.skipDuplicates)
-                            MinimalToggle(title: "Dry run", isOn: $viewModel.isDryRun)
+                            MinimalToggle(title: "Copy (uncheck to move)", isOn: $viewModel.shouldCopyInsteadOfMove)
+                            MinimalToggle(title: "Convert to iOS formats", isOn: $viewModel.convertToIOSFormat)
+                            MinimalToggle(title: "Skip duplicates", isOn: $viewModel.skipDuplicates)
+                            MinimalToggle(title: "Dry run (no changes)", isOn: $viewModel.isDryRun)
                         }
                         
                         // Action buttons
@@ -62,8 +79,8 @@ struct ContentView: View {
                                     .background(Color.black)
                                     .cornerRadius(6)
                             }
-                            .disabled(viewModel.isScanning || viewModel.isProcessing || viewModel.sourceURL == nil)
-                            .opacity(viewModel.sourceURL != nil ? 1 : 0.5)
+                            .disabled(viewModel.isScanDisabled)
+                            .opacity(viewModel.isScanDisabled ? 0.5 : 1)
                             
                             Button(action: { viewModel.startProcessing() }) {
                                 Text("Process")
@@ -74,8 +91,21 @@ struct ContentView: View {
                                     .background(Color.black)
                                     .cornerRadius(6)
                             }
-                            .disabled(!viewModel.scanComplete || viewModel.isProcessing)
-                            .opacity(viewModel.scanComplete && !viewModel.isProcessing ? 1 : 0.5)
+                            .disabled(viewModel.isProcessDisabled)
+                            .opacity(viewModel.isProcessDisabled ? 0.5 : 1)
+                            
+                            // Cancel button - shown during operations
+                            if viewModel.isScanning || viewModel.isProcessing {
+                                Button(action: { viewModel.cancelOperation() }) {
+                                    Text("Cancel")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .frame(width: 60)
+                                        .frame(height: 28)
+                                        .foregroundColor(.white)
+                                        .background(Color.red.opacity(0.8))
+                                        .cornerRadius(6)
+                                }
+                            }
                         }
                         
                         // Progress
@@ -88,6 +118,12 @@ struct ContentView: View {
                                         .font(.system(size: 9, weight: .regular))
                                         .foregroundColor(.gray)
                                     Spacer()
+                                    
+                                    if let timeRemaining = viewModel.estimatedTimeRemaining {
+                                        Text(timeRemaining)
+                                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                                            .foregroundColor(.gray)
+                                    }
                                 }
                                 
                                 if let progress = viewModel.progress {
@@ -101,12 +137,21 @@ struct ContentView: View {
                                     }
                                 }
                                 
-                                if let fileName = viewModel.currentFileName {
-                                    Text(fileName)
-                                        .font(.system(size: 8, weight: .regular, design: .monospaced))
-                                        .foregroundColor(.gray.opacity(0.7))
-                                        .lineLimit(1)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                HStack {
+                                    if let fileName = viewModel.currentFileName {
+                                        Text(fileName)
+                                            .font(.system(size: 8, weight: .regular, design: .monospaced))
+                                            .foregroundColor(.gray.opacity(0.7))
+                                            .lineLimit(1)
+                                    }
+                                    
+                                    Spacer()
+                                    
+                                    if let speed = viewModel.processingSpeed {
+                                        Text(speed)
+                                            .font(.system(size: 8, weight: .regular, design: .monospaced))
+                                            .foregroundColor(.gray.opacity(0.7))
+                                    }
                                 }
                             }
                             .padding(8)
@@ -118,10 +163,16 @@ struct ContentView: View {
                         VStack(spacing: 4) {
                             MinimalStatRow(label: "Scanned", value: viewModel.totalFilesScanned)
                             MinimalStatRow(label: "Found", value: viewModel.totalMediaFound)
+                            MinimalStatRowText(label: "Total Size", value: viewModel.totalSizeFormatted)
                             MinimalStatRow(label: "Processed", value: viewModel.totalCopiedSuccessfully)
                             MinimalStatRow(label: "Converted", value: viewModel.totalConverted)
                             MinimalStatRow(label: "Duplicates", value: viewModel.totalSkippedDuplicates)
+                            MinimalStatRow(label: "Skipped", value: viewModel.totalSkipped)
                             MinimalStatRow(label: "Errors", value: viewModel.errorCount, isError: true)
+                            
+                            if let diskSpace = viewModel.availableDiskSpace {
+                                MinimalStatRowText(label: "Disk Space", value: diskSpace)
+                            }
                         }
                         
                         // Bottom actions
@@ -129,11 +180,18 @@ struct ContentView: View {
                             Button(action: { viewModel.undoLastOperation() }) {
                                 Text("Undo")
                                     .font(.system(size: 9, weight: .semibold))
+                                    .foregroundColor(viewModel.canUndo ? .gray : .gray.opacity(0.4))
+                            }
+                            .disabled(!viewModel.canUndo)
+                            
+                            Button(action: { viewModel.exportLogs() }) {
+                                Text("Logs")
+                                    .font(.system(size: 9, weight: .semibold))
                                     .foregroundColor(.gray)
                             }
                             
-                            Button(action: { try? viewModel.exportLogs() }) {
-                                Text("Logs")
+                            Button(action: { viewModel.clearLogs() }) {
+                                Text("Clear")
                                     .font(.system(size: 9, weight: .semibold))
                                     .foregroundColor(.gray)
                             }
@@ -144,22 +202,28 @@ struct ContentView: View {
                         // Log
                         if !viewModel.logMessages.isEmpty {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("Log")
-                                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                                    .foregroundColor(.gray)
-                                
-                                ScrollView {
-                                    VStack(alignment: .leading, spacing: 0) {
-                                        ForEach(viewModel.logMessages.suffix(8), id: \.self) { log in
-                                            Text(log)
-                                                .font(.system(size: 7, weight: .regular, design: .monospaced))
-                                                .foregroundColor(.gray.opacity(0.6))
-                                                .lineLimit(1)
-                                        }
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                HStack {
+                                    Text("Log (\(viewModel.logMessages.count))")
+                                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                                        .foregroundColor(.gray)
+                                    Spacer()
                                 }
-                                .frame(height: 80)
+                                
+                                ScrollViewReader { proxy in
+                                    ScrollView {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            ForEach(Array(viewModel.logMessages.suffix(50).enumerated()), id: \.offset) { index, log in
+                                                Text(log)
+                                                    .font(.system(size: 7, weight: .regular, design: .monospaced))
+                                                    .foregroundColor(log.contains("❌") ? .red.opacity(0.8) : .gray.opacity(0.6))
+                                                    .lineLimit(2)
+                                                    .id(index)
+                                            }
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    .frame(height: 100)
+                                }
                             }
                         }
                     }
@@ -167,14 +231,22 @@ struct ContentView: View {
                 }
             }
         }
-        .frame(minWidth: 420, minHeight: 500)
+        .frame(minWidth: 480, minHeight: 600)
+        .alert("Error", isPresented: $viewModel.showAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(viewModel.alertMessage ?? "An unknown error occurred")
+        }
     }
 }
+
+// MARK: - Subviews
 
 struct MinimalFolderCard: View {
     let title: String
     let subtitle: String
     let selectedPath: String?
+    let fullPath: String?
     let action: () -> Void
     
     var body: some View {
@@ -191,11 +263,20 @@ struct MinimalFolderCard: View {
             }
             
             HStack(spacing: 6) {
-                Text(selectedPath ?? "Choose")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundColor(selectedPath != nil ? .gray : .gray.opacity(0.5))
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(selectedPath ?? "Choose folder...")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundColor(selectedPath != nil ? .primary : .gray.opacity(0.5))
+                        .lineLimit(1)
+                    
+                    if let fullPath = fullPath {
+                        Text(fullPath)
+                            .font(.system(size: 7, design: .monospaced))
+                            .foregroundColor(.gray.opacity(0.5))
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 
                 Button(action: action) {
                     Text("Select")
@@ -249,6 +330,27 @@ struct MinimalStatRow: View {
             Text("\(value)")
                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
                 .foregroundColor(isError && value > 0 ? .red : .black)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Color.white)
+        .cornerRadius(6)
+    }
+}
+
+struct MinimalStatRowText: View {
+    let label: String
+    let value: String
+    
+    var body: some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 9, weight: .light))
+                .foregroundColor(.gray)
+            Spacer()
+            Text(value)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(.black)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
